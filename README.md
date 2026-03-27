@@ -28,14 +28,9 @@ This library does it once. Subclass `FramelessWindow`, point it at your title ba
 ## Install
 
 ```bash
-pip install pyside-frameless
-```
-
-Or as a git submodule:
-
-```bash
 git submodule add https://github.com/you/pyside-frameless.git pyside_frameless
 ```
+or clone and use as module directly.
 
 ## Quick start
 
