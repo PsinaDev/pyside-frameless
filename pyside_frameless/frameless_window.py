@@ -44,6 +44,25 @@ class FramelessWindow(QMainWindow):
     A frameless QMainWindow with native Aero Snap on Windows
     and cross-platform fallback resize handling.
 
+    Parameters
+    ----------
+    parent : QWidget, optional
+        Parent widget.
+    translucent : bool, default False
+        If True, the window has a translucent background. Use for
+        non-rectangular UI like a desktop pet — the widget paints what
+        it wants and unpainted pixels are see-through.
+    stay_on_top : bool, default False
+        If True, ``Qt.WindowStaysOnTopHint`` is added so the window
+        floats above regular windows.
+    drag_anywhere : bool, default False
+        If True, the whole client area is a drag region and the window
+        is moved via the OS native ``startSystemMove``. Right-clicks
+        and other mouse events are preserved (HTCLIENT, not HTCAPTION),
+        so consumers can install their own ``contextMenuEvent``.
+        When False (default), only the widget passed to
+        :meth:`set_title_bar_widget` is the drag region.
+
     Usage::
 
         class MyWindow(FramelessWindow):
@@ -58,7 +77,14 @@ class FramelessWindow(QMainWindow):
 
     RESIZE_MARGIN = 8
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        translucent: bool = False,
+        stay_on_top: bool = False,
+        drag_anywhere: bool = False,
+    ):
         super().__init__(parent)
 
         # Title-bar widget registered externally
@@ -73,6 +99,11 @@ class FramelessWindow(QMainWindow):
         self._maximized_state: bool = False
         self._normal_geometry: QRect | None = None
 
+        # New opt-in features
+        self._translucent: bool = translucent
+        self._stay_on_top: bool = stay_on_top
+        self._drag_anywhere: bool = drag_anywhere
+
         self._apply_frameless_flags()
 
     # ------------------------------------------------------------------
@@ -80,7 +111,12 @@ class FramelessWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def set_title_bar_widget(self, widget: QWidget) -> None:
-        """Designate *widget* as the title bar (drag region)."""
+        """Designate *widget* as the title bar (drag region).
+
+        Has no effect when the window was created with
+        ``drag_anywhere=True`` — in that case the entire client area
+        is the drag region.
+        """
         self._title_bar = widget
 
     def toggle_maximize(self) -> None:
@@ -127,8 +163,15 @@ class FramelessWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _apply_frameless_flags(self) -> None:
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        flags = Qt.WindowType.FramelessWindowHint
+        if self._stay_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+
+        # Translucency must be set before the native window is realized.
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, self._translucent
+        )
         self.setMouseTracking(True)
 
     # ------------------------------------------------------------------
@@ -219,7 +262,7 @@ class FramelessWindow(QMainWindow):
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
     # ------------------------------------------------------------------
-    # Mouse events (fallback resize)
+    # Mouse events (fallback resize + drag-anywhere drag)
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event) -> None:
@@ -229,6 +272,18 @@ class FramelessWindow(QMainWindow):
                 self._resize_edge = edge
                 self._resize_start_pos = event.globalPosition().toPoint()
                 self._resize_start_geometry = self.geometry()
+            elif self._drag_anywhere:
+                # Body click: ask the OS to start a native window move.
+                # On Windows this only fires when WM_NCHITTEST returned
+                # HTCLIENT (i.e. we're not on a resize edge), since edge
+                # presses are intercepted natively. On other platforms
+                # the explicit edge check above takes precedence.
+                handle = self.windowHandle()
+                if handle is not None:
+                    try:
+                        handle.startSystemMove()
+                    except Exception as e:  # pragma: no cover
+                        logger.warning("startSystemMove failed: %s", e)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -326,13 +381,17 @@ class FramelessWindow(QMainWindow):
                 x_logical = int(x_phys / dpr)
                 y_logical = int(y_phys / dpr)
 
-                widget_at_pos = QApplication.widgetAt(x_logical, y_logical)
-                if widget_at_pos is not None:
-                    w_check = widget_at_pos
-                    while w_check is not None and w_check is not self:
-                        if isinstance(w_check, QPushButton):
-                            return True, HTCLIENT
-                        w_check = w_check.parentWidget()
+                # In drag-anywhere mode we deliberately skip the
+                # widget-walk-for-QPushButton trick; the whole body is
+                # HTCLIENT and Qt mouse events flow normally.
+                if not self._drag_anywhere:
+                    widget_at_pos = QApplication.widgetAt(x_logical, y_logical)
+                    if widget_at_pos is not None:
+                        w_check = widget_at_pos
+                        while w_check is not None and w_check is not self:
+                            if isinstance(w_check, QPushButton):
+                                return True, HTCLIENT
+                            w_check = w_check.parentWidget()
 
                 hwnd = int(self.winId())
                 rect = wintypes.RECT()
@@ -344,7 +403,6 @@ class FramelessWindow(QMainWindow):
                 h = rect.bottom - rect.top
 
                 border = int(8 * dpr)
-                title_height = int(40 * dpr) if self._title_bar else int(8 * dpr)
 
                 is_maximized = bool(self.windowState() & Qt.WindowState.WindowMaximized)
 
@@ -366,6 +424,13 @@ class FramelessWindow(QMainWindow):
                     if rel_y > h - border:
                         return True, HTBOTTOM
 
+                if self._drag_anywhere:
+                    # Body is HTCLIENT — we initiate drag ourselves via
+                    # startSystemMove so right-clicks can reach Qt for
+                    # contextMenuEvent handling.
+                    return True, HTCLIENT
+
+                title_height = int(40 * dpr) if self._title_bar else int(8 * dpr)
                 if rel_y < title_height:
                     return True, HTCAPTION
 
